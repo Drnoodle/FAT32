@@ -1,0 +1,1 @@
+Place testfs.fat and compiled vfat binary into this directory, then run ./test.py

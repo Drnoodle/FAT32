@@ -1,0 +1,424 @@
+
+
+
+//_________________________________________________________________  PRIVATE
+
+
+#include <assert.h>
+#include <endian.h>
+#include <err.h>
+#include <errno.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <inttypes.h>
+#include "vfat_cluster.h"
+
+
+
+/**
+ * @brief A fat32 direntry (short)
+ */
+ struct fat32_direntry {
+     /* 0*/  union {
+         struct {
+             char name[8];
+             char ext[3];
+         };
+         char nameext[11];
+     };
+     /*11*/  uint8_t  attr;
+     /*12*/  uint8_t  res;
+     /*13*/  uint8_t  ctime_ms;
+     /*14*/  uint16_t ctime_time;
+     /*16*/  uint16_t ctime_date;
+     /*18*/  uint16_t atime_date;
+     /*20*/  uint16_t cluster_hi;
+     /*22*/  uint16_t mtime_time;
+     /*24*/  uint16_t mtime_date;
+     /*26*/  uint16_t cluster_lo;
+     /*28*/  uint32_t size;
+ } __attribute__ ((__packed__));
+
+#define VFAT_ATTR_DIR   0x10
+#define VFAT_ATTR_LFN   0xf
+#define VFAT_ATTR_INVAL (0x80|0x40|0x08)
+
+
+
+/**
+ * @brief A fat32 direntry (long)
+ */
+ struct fat32_direntry_long {
+     /* 0*/  uint8_t  seq;
+     /* 1*/  uint16_t name1[5];
+     /*11*/  uint8_t  attr;
+     /*12*/  uint8_t  type;
+     /*13*/  uint8_t  csum;
+     /*14*/  uint16_t name2[6];
+     /*26*/  uint16_t reserved2;
+     /*28*/  uint16_t name3[2];
+ } __attribute__ ((__packed__));
+
+#define VFAT_LFN_SEQ_START      0x40
+#define VFAT_LFN_SEQ_DELETED    0x80
+#define VFAT_LFN_SEQ_MASK       0x3f
+
+
+
+/**
+ * @brief A direntry that can contains a pointer to a string,
+ * it's used to parse the name of a file
+ * and provides the number of direntries that was needed
+ * to extract the information.
+ */
+ struct parsed_name {
+     char name[256];
+     size_t total_entry_parsed;
+ };
+
+/**
+ * @brief A search entry used to querry a file or
+ * a subfolder in a given folder.
+ */
+struct vfat_search_data {
+    const char*  name;
+    int          found;
+    struct stat* st;
+};
+
+
+ /**
+ * @param direntry A pointer to a direntry.
+ * @return A boolean value answering : is a long direntry ?
+ * @author Hugo Bonnome
+ */
+ int is_long_dir_entry(struct fat32_direntry * direntry){
+
+     return direntry->attr & 0xF == 0xF;
+ }
+
+
+ /**
+  * @param c A pointer to a character
+  * @return A boolean answering :
+  * is the charactere conform to the fat32 filename ?
+  */
+ int is_a_conform_filename_char(char * c){
+
+     int is_valid = 1;
+     is_valid = (is_valid & (*c > 0x20));
+     is_valid = (is_valid & (*c != 0x22));
+     is_valid = (is_valid & (*c != 0x2A));
+     is_valid = (is_valid & (*c != 0x2E));
+     is_valid = (is_valid & (*c != 0x2F));
+     is_valid = (is_valid & (*c != 0x3A));
+     is_valid = (is_valid & (*c != 0x3B));
+     is_valid = (is_valid & (*c != 0x3C));
+     is_valid = (is_valid & (*c != 0x3D));
+     is_valid = (is_valid & (*c != 0x3E));
+     is_valid = (is_valid & (*c != 0x3F));
+     is_valid = (is_valid & (*c != 0x5B));
+     is_valid = (is_valid & (*c != 0x5C));
+     is_valid = (is_valid & (*c != 0x5D));
+     is_valid = (is_valid & (*c != 0x7C));
+
+     return is_valid;
+ }
+
+
+ /**
+ * @param direntry A pointer to a fat32_direntry.
+ * @return A boolean value answering : is a valid direntry ?
+ * @author Hugo Bonnome
+ */
+ int is_a_valid_dir_entry_short(struct fat32_direntry * direntry){
+
+    int is_valid = 1;
+    is_valid = direntry->name[0] != 0xE5;
+    is_valid = is_valid &&  direntry->name[0] != 0x0;
+
+     for(int i = 0; i<11; i++){
+         is_valid = is_valid & is_a_conform_filename_char(direntry->name[i]);
+     }
+
+     return is_valid;
+ }
+
+
+vfat_directory.c: In function ‘is_long_dir_entry’:
+vfat_directory.c:101:6: warning: suggest parentheses around comparison in operand of ‘&’ [-Wparentheses]
+vfat_directory.c: In function ‘is_a_valid_dir_entry_short’:
+vfat_directory.c:145:10: warning: passing argument 1 of ‘is_a_conform_filename_char’ makes pointer from integer without a cast [enabled by default]
+vfat_directory.c:110:6: note: expected ‘char *’ but argument is of type ‘char’
+vfat_directory.c: In function ‘is_a_valid_dir_entry_long’:
+vfat_directory.c:162:5: warning: suggest parentheses around comparison in operand of ‘&’ [-Wparentheses]
+
+/**
+ * @param direntry A pointer to a direntry_long.
+ * @return A boolean value answering : is a valid direntry_long ?
+ * @author Hugo Bonnome
+ */
+ int is_a_valid_dir_entry_long(
+         struct fat32_direntry_long * direntry,
+         unsigned char expected_checksum){
+
+    int is_valid = 1;
+    is_valid = direntry->attr & 0xF == 0xF;
+    is_valid = direntry->seq <= 0x40;
+    is_valid = direntry->csum == expected_checksum;
+
+    return is_valid;
+ }
+
+
+/**
+ * @brief compute The checksum of the filename.
+ * @param pFcbName The name to be hashed
+ * @author Microsoft
+ */
+unsigned char checksum(unsigned char *pFcbName){  
+
+    short fcbNameLen;
+     
+    unsigned char sum = 0;
+     
+    for (fcbNameLen = 11; fcbNameLen!=0; fcbNameLen--) {  
+        sum = ((sum & 1) ? 0x80 : 0) + (sum >> 1) + *pFcbName++;
+    }   
+
+    return sum; 
+}
+
+
+ /**
+  * @param data A pointer to the beginning of a long direntry.
+  * @param entry A pointer to a parsed name that will contains the result.
+  * @param expected_checksum The checksum of the short direntry name.
+  * @return A boolean answering : is an error during parsing process ?
+  * @author Hugo Bonnome
+  */
+int parse_long_name(
+        const unsigned char * data,
+        struct parsed_name * parsed_name,
+        char expected_checksum){
+
+     int hasError = 0;
+
+     parsed_name->total_entry_parsed = 0;
+
+     struct fat32_direntry_long * direntry_long = (struct fat32_direntry_long *)data;
+
+     int str_length = 0;
+
+     // TODO : consecutive direntrylong (short) with same checksum?
+     while(is_a_valid_dir_entry_long(direntry_long, expected_checksum)){
+	
+         // TODO : review uint16 -> char
+	
+
+        for(int i = 0; i<5; i++){
+            parsed_name[str_length] = (char)direntry_long->name1[i];
+            parsed_name[str_length+1] = (char)direntry_long->name1[i] >> 8;
+            str_length +=2;
+        }
+        for(int i = 0; i<6; i++){
+            parsed_name[str_length] = (char)direntry_long->name2[i];
+            parsed_name[str_length+1] = (char)direntry_long->name2[i] >> 8;
+            str_length +=2;
+        }
+        for(int i = 0; i<2; i++){
+            parsed_name[str_length] = (char)direntry_long->name3[i];
+            parsed_name[str_length+1] = (char)direntry_long->name3[i] >> 8;
+            str_length +=2;
+        }
+
+        parsed_entry->total_entry_parsed++;
+        data += sizeof(struct fat32_direntry_long);
+        direntry_long = (struct fat32_direntry_long *)data;
+     }
+
+	parsed_name[str_length] = '\0';
+
+     return 0;
+}
+
+
+
+ //_________________________________________________________________  PUBLIC
+
+
+ int vfat_readdir(
+         uint32_t first_cluster,
+         fuse_fill_dir_t callback,
+         void *callbackdata) {
+
+     struct stat st;
+     struct parsed_name parsed_name;
+     struct fat32_direntry * short_direntry;
+     // iterate through each file in the dir
+
+     unsigned char * data = calloc(vfat_info.cluster_size, cluster_chain_size(first_cluster));
+     load_cluster_chain(data, first_cluster);
+
+     // TODO verifiy end of dir
+     while(data[0] == 0xE5) {
+
+         // instanciate struct stat about a file (file info used by fuse)
+         memset(&st, 0, sizeof(st));
+         st.st_uid = vfat_info.mount_uid;
+         st.st_gid = vfat_info.mount_gid;
+         st.st_nlink = 1;
+
+         // get the first short direntry
+         short_direntry = (struct fat32_direntry *)data;
+
+         if(!is_a_valid_dir_entry_short(short_direntry)){
+             continue;
+         }
+
+         // move on to next data
+         data += sizeof(struct fat32_direntry);
+
+
+         if(is_long_dir_entry(short_direntry)){
+             // TODO verify + ext ?
+             char checksum = checksum(short_direntry->name);
+             int isError = parse_long_name(data,&parsed_name,checksum);
+
+             if(isError){
+                 continue;
+             }
+
+             off_t offset = 0; // TODO ???
+             // TODO name+ext?
+             callback(callbackdata,parsed_name.name,st,offset);
+
+         }
+         else { //is a short name
+             // TODO name+ext?
+             callback(callbackdata,short_direntry->name,st,offset);
+         }
+
+     }
+
+
+     free(data);
+
+     return 0;
+ }
+
+
+// You can use this in vfat_resolve as a callback function for vfat_readdir
+// This way you can get the struct stat of the subdirectory/file.
+ int vfat_search_entry(
+         void *data,
+         const char *name,
+         const struct stat *st,
+         off_t offs) {
+
+
+     struct vfat_search_data *sd = data;
+
+    // entry is not the searched one
+     if (strcmp(sd->name, name) != 0){
+         return 0;
+     }
+
+     sd->found = 1;
+     *sd->st = *st;
+
+     return 1;
+ }
+
+
+/**
+ * Fills in stat info for a file/directory given the path
+ * @path full path to a file, directories separated by slash
+ * @st file stat structure
+ * @returns 0 iff operation completed succesfully -errno on error
+*/
+ int vfat_resolve(const char *path, struct stat *st)
+ {
+     /* TODO: Add your code here.
+         You should tokenize the path (by slash separator) and then
+         for each token search the directory for the file/dir with that name.
+         You may find it useful to use following functions:
+         - strtok to tokenize by slash. See manpage
+         - vfat_readdir in conjuction with vfat_search_entry
+     */
+
+     int res = -ENOENT; // Not Found
+     if (strcmp("/", path) == 0) {
+         *st = vfat_info.root_inode;
+         res = 0;
+     }
+
+     char delim[2] = "/";
+     char * token = NULL;
+     token = strok(path,delim);
+
+     struct vfat_search_data search_req;
+
+     while(token != NULL){
+
+         search_res.name = token;
+
+         vfat_readdir(vfat_info.root_dir,vfat_search_entry,&search_req);
+
+         token = strok(NULL, delim);
+
+         if(!search_req.found){
+             return -ERRNO;
+         }
+
+     }
+
+
+
+     return res;
+ }
+
+
+
+void test_read_root(uint32_t first_cluster){
+
+    fprintf(stderr, " :: TEST ROOT DIR ::\n");
+
+    int clust_chain_size = cluster_chain_size(first_cluster);
+    fprintf(stderr, "cluster chain length ok : %d", clust_chain_size);
+    unsigned char buff[clust_chain_size*vfat_info.cluster_size];
+    fprintf(stderr, "load...\n");
+    int totalLoadedCluster = load_cluster_chain(buff, first_cluster);
+    fprintf(stderr, "ok\n");
+    if(totalLoadedCluster != clust_chain_size){
+        errx(1, "error reading cluster chain : read : %d, expected %d", totalLoadedCluster, clust_chain_size);
+    }
+
+    off_t offset = 0;
+    while(offset < clust_chain_size*vfat_info.cluster_size && buff[offset] != 0x0){
+
+        if(buff[offset] != 0xE5){
+
+            struct fat32_direntry * direntry = &buff[offset];
+            int is_long_name = direntry->attr&0xF == 0xF;
+
+            if(is_long_name) {
+                fprintf(stderr, direntry->name);
+                fprintf(stderr, ".");
+                fprintf(stderr, direntry->ext);
+                fprintf(stderr, "\n");
+            }
+            else {
+                fprintf(stderr, "long filename\n");
+            }
+        }
+        offset += sizeof(struct fat32_direntry);
+    }
+
+    fprintf(stderr, "TEST DONE!\n");
+
+}
